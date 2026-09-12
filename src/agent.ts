@@ -74,6 +74,34 @@ export interface AgentParts {
     tool: Tool,
     args: Record<string, unknown>,
   ) => Promise<boolean> | boolean;
+  /**
+   * Whether an answer ends the run. `true` accepts it; a string is the
+   * objection put to the model, which costs a step and the loop goes on.
+   *
+   * A model that says it is done is reporting, not proving, and the loop
+   * cannot tell the difference on its own — only the caller knows what the
+   * task was for. `granite4.2:3b-q8_0` finished a translation run with
+   * "Please provide the requested shape as a JSON object" and no file written,
+   * and the run was a success because the string was not empty. Measured
+   * 2026-09-12.
+   */
+  readonly acceptAnswer?: (
+    text: string,
+  ) => Promise<true | string> | true | string;
+  /**
+   * How many times one call may give the same answer, or one reply may repeat
+   * itself without moving, before the run is stopped. Two by default: one is a
+   * slip and gets a nudge, and every step past the second spends tokens to be
+   * told the same thing.
+   *
+   * Raise it where something under the loop can rescue a stuck turn. A router
+   * escalates on the ask *after* the stuck one, so a limit that stops at the
+   * same moment denies the rescue: `granite4.2:3b-q8_0` re-read two files, the
+   * loop stopped at the second repeat, and the cloud side never got the turn
+   * that would have finished the work. A limit above the router's own
+   * threshold is what leaves room for it.
+   */
+  readonly stuckLimit?: number;
   readonly onEvent?: (event: AgentEvent) => void;
 }
 
@@ -84,7 +112,7 @@ export interface AgentRun {
   readonly constrained: boolean;
 }
 
-const DEFAULTS = { maxSteps: 12, maxResultChars: 4_000 };
+const DEFAULTS = { maxSteps: 12, maxResultChars: 4_000, stuckLimit: 2 };
 
 const INSTRUCTIONS =
   "You are a careful assistant with tools. Work in small steps: call one tool, read its result, then decide. Answer only when the task is done or cannot be done.";
@@ -141,19 +169,68 @@ const parseObject = (text: string): Record<string, unknown> | null => {
   }
 };
 
-/** Whole first, then the widest braces in it: prose mode wraps the object in words or a fence. */
-const readObject = (text: string): Record<string, unknown> | null => {
-  const wholeObject = parseObject(text.trim());
-  if (wholeObject !== null) return wholeObject;
-  const firstBrace = text.indexOf("{");
-  const lastBrace = text.lastIndexOf("}");
-  if (firstBrace < 0 || lastBrace <= firstBrace) return null;
-  return parseObject(text.slice(firstBrace, lastBrace + 1));
+/**
+ * Every `{…}` in the text that balances, in the order they open.
+ *
+ * String-aware, and it has to be: the argument of a write tool is a whole
+ * file, and a brace counter that does not skip quoted text closes the object
+ * on the first `}` in the code it carries.
+ */
+const findObjectSpans = (text: string): string[] => {
+  const spans: string[] = [];
+  let openedAt = -1;
+  let depth = 0;
+  let isInString = false;
+  let isEscaped = false;
+  for (let index = 0; index < text.length; index += 1) {
+    const character = text[index];
+    if (isInString) {
+      if (isEscaped) isEscaped = false;
+      else if (character === "\\") isEscaped = true;
+      else if (character === '"') isInString = false;
+      continue;
+    }
+    if (character === '"') isInString = true;
+    else if (character === "{") {
+      if (depth === 0) openedAt = index;
+      depth += 1;
+    } else if (character === "}" && depth > 0) {
+      depth -= 1;
+      if (depth === 0) spans.push(text.slice(openedAt, index + 1));
+    }
+  }
+  return spans;
 };
 
-const readStep = (text: string): Step | null => {
-  const fields = readObject(text);
-  if (fields === null) return null;
+/**
+ * The objects in a reply, last first, because the last is the model's final
+ * word on what to do.
+ *
+ * Constrained, the whole text is the object and the first line here is the
+ * whole of it. Unconstrained it is not: `granite4.2:3b-q8_0`, asked in prose
+ * because the schema does not reach the local side of an orchestrator,
+ * answered with a correct object, then 30k characters of second thoughts about
+ * it, then a corrected object. The widest braces span all three, so the reply
+ * that carried two usable answers parsed as none. Measured 2026-09-12.
+ */
+const readObjects = (text: string): readonly Record<string, unknown>[] => {
+  const wholeObject = parseObject(text.trim());
+  if (wholeObject !== null) return [wholeObject];
+  const balancedObjects = findObjectSpans(text)
+    .map(parseObject)
+    .filter((object): object is Record<string, unknown> => object !== null)
+    .reverse();
+  if (balancedObjects.length > 0) return balancedObjects;
+  // Nothing balanced, which is what a cut-off reply leaves: the widest braces
+  // are the last thing to try before calling it prose.
+  const firstBrace = text.indexOf("{");
+  const lastBrace = text.lastIndexOf("}");
+  if (firstBrace < 0 || lastBrace <= firstBrace) return [];
+  const widestObject = parseObject(text.slice(firstBrace, lastBrace + 1));
+  return widestObject === null ? [] : [widestObject];
+};
+
+const toStep = (fields: Record<string, unknown>): Step | null => {
   const action = fields.action;
   if (action !== "tool" && action !== "answer") return null;
   // "call a tool" with no name is malformed output, not a call to a tool that
@@ -166,6 +243,15 @@ const readStep = (text: string): Step | null => {
     args: asRecord(fields.args) ?? {},
     answer: asText(fields.answer),
   };
+};
+
+/** The last object that is a step: an example or a draft before it is not the decision. */
+const readStep = (text: string): Step | null => {
+  for (const fields of readObjects(text)) {
+    const step = toStep(fields);
+    if (step !== null) return step;
+  }
+  return null;
 };
 
 const errorText = (error: unknown): string =>
@@ -213,16 +299,6 @@ type SeenResults = Map<string, string>;
 
 const toCallKey = (step: Step): string =>
   `${step.tool}(${JSON.stringify(step.args)})`;
-
-/**
- * How many identical calls in a row before the run is stopped.
- *
- * One is a slip and gets a nudge. Two in a row means the nudge was not read
- * either, and every further step spends tokens to be told the same thing:
- * `granite4:350m` asked for a tool that does not exist eight times running,
- * and was handed the list of real ones eight times.
- */
-const STUCK_LIMIT = 2;
 
 const runTool = async (
   step: Step,
@@ -290,8 +366,44 @@ export async function runAgent(
     parts.instructions ?? INSTRUCTIONS,
   );
 
+  const stuckLimit = parts.stuckLimit ?? DEFAULTS.stuckLimit;
   const seenResults: SeenResults = new Map();
-  let stuckCount = 0;
+  /**
+   * Repeats counted per call, not once for the whole run.
+   *
+   * One counter for every call said "stuck" when two *different* calls each
+   * repeated once, which is a model going round a wider circle, not a model
+   * jammed on one tool — and it then named the last call and a number that
+   * belonged to the counter rather than to that call: `readFile(lib.ml)`
+   * reported as called three times when it had been called twice. Measured
+   * 2026-09-12.
+   */
+  const repeatsByCall = new Map<string, number>();
+  /**
+   * A turn that ran nothing and finished nothing: an unreadable reply, an
+   * empty answer, an answer the caller sent back. The same prompt gets the
+   * same reply out of a model at rest, so a reply identical to the last barren
+   * one is a loop — `granite4.2:3b-q8_0` answered
+   * `{"action":"answer","answer":""}` seven times word for word, after the
+   * work was done and verified, and nothing noticed because only tool calls
+   * were watched. Measured 2026-09-12.
+   */
+  let barrenReply: string | null = null;
+  let barrenRepeats = 0;
+
+  const isBarrenLoop = (reply: string): boolean => {
+    barrenRepeats = reply === barrenReply ? barrenRepeats + 1 : 0;
+    barrenReply = reply;
+    return barrenRepeats >= stuckLimit;
+  };
+
+  const barrenFailure = (): Result<never, AiFailure> => ({
+    ok: false,
+    error: {
+      kind: "failed",
+      detail: `the agent gave the same reply ${barrenRepeats + 1} times without calling a tool or finishing`,
+    },
+  });
 
   for (let stepNumber = 1; stepNumber <= maxSteps; stepNumber += 1) {
     emit({ kind: "step", step: stepNumber, maxSteps });
@@ -300,6 +412,7 @@ export async function runAgent(
 
     const decidedStep = readStep(thoughtResult.value);
     if (decidedStep === null) {
+      if (isBarrenLoop(thoughtResult.value)) return barrenFailure();
       // A repair costs a step, which keeps the bound honest.
       input = `That was not the shape asked for. ${SHAPE_REMINDER}`;
       continue;
@@ -309,8 +422,15 @@ export async function runAgent(
     if (decidedStep.action === "answer") {
       const text = decidedStep.answer.trim();
       if (text === "") {
+        if (isBarrenLoop(thoughtResult.value)) return barrenFailure();
         input =
           'The answer was empty. Give the final text in "answer", or call a tool.';
+        continue;
+      }
+      const verdict = (await parts.acceptAnswer?.(text)) ?? true;
+      if (verdict !== true) {
+        if (isBarrenLoop(thoughtResult.value)) return barrenFailure();
+        input = `${verdict} ${SHAPE_REMINDER}`;
         continue;
       }
       emit({ kind: "answer", step: stepNumber, text });
@@ -334,7 +454,11 @@ export async function runAgent(
     // actually happened.
     const isRepeat = seenResults.get(callKey) === toolOutcome.rendered;
     seenResults.set(callKey, toolOutcome.rendered);
-    stuckCount = isRepeat ? stuckCount + 1 : 0;
+    const repeatsHere = isRepeat ? (repeatsByCall.get(callKey) ?? 0) + 1 : 0;
+    repeatsByCall.set(callKey, repeatsHere);
+    // Work happened, whatever else is true: the barren run is broken.
+    barrenReply = null;
+    barrenRepeats = 0;
 
     emit({
       kind: "result",
@@ -346,12 +470,12 @@ export async function runAgent(
     // The contract carries user and assistant turns and nothing else, so a
     // tool result goes back as the next user message. That is the whole of the
     // mapping, and it is why no tool protocol was needed in the contract.
-    if (stuckCount >= STUCK_LIMIT) {
+    if (repeatsHere >= stuckLimit) {
       return {
         ok: false,
         error: {
           kind: "failed",
-          detail: `the agent called ${callKey} ${stuckCount + 1} times for the same answer and did not move on`,
+          detail: `the agent called ${callKey} ${repeatsHere + 1} times for the same answer and did not move on`,
         },
       };
     }

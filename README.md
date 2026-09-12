@@ -133,6 +133,46 @@ third one stops the run and says which call it was. Six steps and a diagnosis
 instead of eight and a shrug. It does not make the model capable; it makes the
 failure legible.
 
+**The answer is the last object in the reply, not the widest braces in it.**
+Unconstrained — which is what an orchestrator's local side was until
+`Orchestrator.ask` learned to pass a schema through — `granite4.2:3b-q8_0`
+answered a write step with a correct object, then 30 000 characters of second thoughts about it,
+then a corrected object. Reading from the first `{` to the last `}` spans all
+three and parses as none, so a reply carrying two usable answers was thrown
+away as prose and the run ended having written nothing. The scan is now
+string-aware, because the argument of a write tool is a whole file and a brace
+counter that does not skip quoted text closes the object on the first `}` in
+the code it carries; the last object that is a step wins, since a draft before
+it is not the decision. Measured 2026-09-12.
+
+**"Done" is a report, and only the caller can check it.** The same run then
+answered `Please provide the requested shape as a JSON object` — a non-empty
+string, so the loop returned it as a success. The loop cannot tell a finished
+task from a model that gave up; what the task was for lives with whoever called
+`runAgent`. `acceptAnswer` is that vote: `true` accepts, and a string is the
+objection put to the model, which costs a step and lets it carry on with the
+steps it has left. The caller that translates OCaml uses it to run the type
+checker before it believes anything.
+
+**A repeat is counted per call, and the stop says a number that is true.**
+One counter for the whole run called it stuck when two _different_ calls each
+repeated once, which is a model going round a wider circle rather than one
+jammed on a tool — and the message then named the last call with the counter's
+number rather than that call's: `readFile(lib.ml)` reported as called three
+times when it had been called twice. Worse, the stop landed on exactly the step
+a router would have escalated on, so the cloud side never got the turn that
+would have finished the work. Hence `stuckLimit`, the caller's to raise above
+its router's own threshold. Measured 2026-09-12.
+
+**A barren reply repeats too, and only tool calls were watched.** After the
+work was done and the type checker green, `granite4.2:3b-q8_0` answered
+`{"reason":"…","action":"answer","answer":""}` seven times word for word, each
+time told the answer was empty, until the step limit ended the run as a
+failure. The same prompt gets the same reply out of a model at rest, so a reply
+identical to the last one that ran nothing and finished nothing is a loop by
+the same rule as an identical call, and it is counted by the same limit.
+Measured 2026-09-12.
+
 **The truncation default is 4 000 characters, not 60 000.** That agent talks to
 a 200k-token cloud model. A local 4096-token window is filled by one file read
 at 60k, so the small default is the one that keeps a local model working.
@@ -153,8 +193,9 @@ npm run chat    # a terminal agent; AGENT_MODEL, ROOT, APPROVE
 ```
 
 The prose branch — a brain that refuses schemas — is reached by a stub here.
-Reaching it live wants a transport that refuses, and that transport lives in
-`modelpact-orchestrator`.
+No transport in the family refuses any more: `claude -p` takes `--json-schema`
+from 2.1.236 on, so the branch is kept for a backend that cannot constrain
+decoding, and for an older CLI, rather than exercised live.
 
 ## Scripts
 

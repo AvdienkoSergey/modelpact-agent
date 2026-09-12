@@ -259,6 +259,116 @@ describe("the agent loop", () => {
     expect(runResult.error.detail).toContain("3 times");
   });
 
+  test("two different calls each repeating once is a wider circle, not a jam", async () => {
+    // One counter for the whole run called this stuck and stopped at the
+    // second repeat, which is also the step a router would have escalated on.
+    const { brain } = makeScriptedBrain([
+      makeToolCallReply("echo", { text: "a" }),
+      makeToolCallReply("echo", { text: "b" }),
+      makeToolCallReply("echo", { text: "a" }),
+      makeToolCallReply("echo", { text: "b" }),
+      makeAnswerReply("got there"),
+    ]);
+    const runResult = await runAgent(
+      { brain, tools: [makeEchoTool()], maxSteps: 20 },
+      "go round",
+    );
+    expect(runResult.ok && runResult.value.text).toBe("got there");
+  });
+
+  test("the stop names the call and a number that is true of it", async () => {
+    const { brain } = makeScriptedBrain([
+      makeToolCallReply("echo", { text: "x" }),
+      makeToolCallReply("echo", { text: "y" }),
+      makeToolCallReply("echo", { text: "x" }),
+      makeToolCallReply("echo", { text: "x" }),
+      makeAnswerReply("never reached"),
+    ]);
+    const runResult = await runAgent(
+      { brain, tools: [makeEchoTool()], maxSteps: 20 },
+      "jam",
+    );
+    expect(runResult.ok).toBe(false);
+    if (runResult.ok || runResult.error.kind !== "failed") return;
+    // Three calls with `x`, and three is what it says.
+    expect(runResult.error.detail).toContain('"text":"x"');
+    expect(runResult.error.detail).toContain("3 times");
+  });
+
+  test("the stuck limit is the caller's, so a router below can still rescue the turn", async () => {
+    const script = [
+      makeToolCallReply("echo"),
+      makeToolCallReply("echo"),
+      makeToolCallReply("echo"),
+      makeAnswerReply("rescued"),
+    ];
+    const tight = await runAgent(
+      { brain: makeScriptedBrain(script).brain, tools: [makeEchoTool()] },
+      "loop",
+    );
+    expect(tight.ok).toBe(false);
+    const roomy = await runAgent(
+      {
+        brain: makeScriptedBrain(script).brain,
+        tools: [makeEchoTool()],
+        stuckLimit: 3,
+      },
+      "loop",
+    );
+    expect(roomy.ok && roomy.value.text).toBe("rescued");
+  });
+
+  test("the same barren reply over and over is a loop, and the run says so", async () => {
+    // `granite4.2:3b-q8_0` answered this, word for word, seven times.
+    const emptyAnswer = makeAnswerReply("");
+    const { brain, recordedAsks } = makeScriptedBrain([
+      emptyAnswer,
+      emptyAnswer,
+      emptyAnswer,
+      makeAnswerReply("never reached"),
+    ]);
+    const runResult = await runAgent({ brain, tools: [] }, "do it");
+    expect(runResult.ok).toBe(false);
+    if (runResult.ok || runResult.error.kind !== "failed") return;
+    expect(runResult.error.detail).toContain("3 times");
+    expect(runResult.error.detail).toContain("without calling a tool");
+    // Stopped rather than burning every step on the same nudge.
+    expect(recordedAsks).toHaveLength(3);
+  });
+
+  test("a rejected answer that changes is not a loop", async () => {
+    const { brain } = makeScriptedBrain([
+      makeAnswerReply("nearly"),
+      makeAnswerReply("almost"),
+      makeAnswerReply("there"),
+    ]);
+    let seen = 0;
+    const runResult = await runAgent(
+      {
+        brain,
+        tools: [],
+        acceptAnswer: () => ((seen += 1) < 3 ? "Not yet." : true),
+      },
+      "do it",
+    );
+    expect(runResult.ok && runResult.value.text).toBe("there");
+  });
+
+  test("work done resets the barren count, so a later slip starts over", async () => {
+    const emptyAnswer = makeAnswerReply("");
+    const { brain } = makeScriptedBrain([
+      emptyAnswer,
+      makeToolCallReply("echo", { text: "progress" }),
+      emptyAnswer,
+      makeAnswerReply("finished"),
+    ]);
+    const runResult = await runAgent(
+      { brain, tools: [makeEchoTool()], maxSteps: 20 },
+      "do it",
+    );
+    expect(runResult.ok && runResult.value.text).toBe("finished");
+  });
+
   test("a repeated failure is a loop too, which is the one that happens", async () => {
     const { brain, recordedAsks } = makeScriptedBrain([
       makeToolCallReply("nosuch"),
@@ -375,6 +485,63 @@ describe("the agent loop", () => {
     ]);
     const runResult = await runAgent({ brain, tools: [] }, "do it");
     expect(runResult.ok && runResult.value.text).toBe("really done");
+  });
+
+  test("second thoughts around the object do not hide it", async () => {
+    // What `granite4.2:3b-q8_0` sends when no schema reaches it: a draft, a
+    // long argument with itself, and then the corrected call.
+    const draft = makeToolCallReply("echo", { text: "draft" });
+    const corrected = makeToolCallReply("echo", { text: "corrected" });
+    const { brain, recordedAsks } = makeScriptedBrain([
+      `${draft}\n\nWait, that is too long. Note { kind: 'Ready' } is not JSON.\n\n${corrected}`,
+      makeAnswerReply("done"),
+    ]);
+    const runResult = await runAgent(
+      { brain, tools: [makeEchoTool()] },
+      "do it",
+    );
+
+    expect(runResult.ok).toBe(true);
+    // The last object is the decision, and the widest braces span all three.
+    expect(recordedAsks[1]?.input).toContain("echoed: corrected");
+    expect(recordedAsks[1]?.input).not.toContain("not the shape asked for");
+  });
+
+  test("braces inside an argument do not end the object", async () => {
+    const fileText = "export function f() { return { a: 1 }; }";
+    const { brain, recordedAsks } = makeScriptedBrain([
+      `Here you go:\n${makeToolCallReply("echo", { text: fileText })}`,
+      makeAnswerReply("done"),
+    ]);
+    await runAgent({ brain, tools: [makeEchoTool()] }, "write it");
+    expect(recordedAsks[1]?.input).toContain(`echoed: ${fileText}`);
+  });
+
+  test("an answer the caller does not accept is put back, not returned", async () => {
+    const { brain, recordedAsks } = makeScriptedBrain([
+      makeAnswerReply("done"),
+      makeToolCallReply("echo", { text: "actually working" }),
+      makeAnswerReply("done for real"),
+    ]);
+    const seenAnswers: string[] = [];
+    const runResult = await runAgent(
+      {
+        brain,
+        tools: [makeEchoTool()],
+        acceptAnswer: (text) => {
+          seenAnswers.push(text);
+          return seenAnswers.length > 1 ? true : "Nothing was written yet.";
+        },
+      },
+      "do it",
+    );
+
+    expect(runResult.ok).toBe(true);
+    if (!runResult.ok) return;
+    // Saying "done" is a report, not a proof; the caller is the one that knows.
+    expect(runResult.value.text).toBe("done for real");
+    expect(seenAnswers).toEqual(["done", "done for real"]);
+    expect(recordedAsks[1]?.input).toContain("Nothing was written yet.");
   });
 
   test("on a real session, through the adapter", async () => {
