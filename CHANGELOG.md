@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.1.1](https://github.com/AvdienkoSergey/modelpact-agent/compare/v1.1.0...v1.1.1) (2026-09-12)
+
+
+### Build System
+
+* **deps-dev:** bump the dev-dependencies group with 4 updates ([376839b](https://github.com/AvdienkoSergey/modelpact-agent/commit/376839be533525b57c5f1cea3aeb2ef6077b892c))
+
 ## [1.1.0](https://github.com/AvdienkoSergey/modelpact-agent/compare/v1.0.0...v1.1.0) (2026-09-12)
 
 
