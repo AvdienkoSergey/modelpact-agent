@@ -1,6 +1,6 @@
 {
   "name": "modelpact-agent",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "A tool-calling agent on storey three: a loop over sessions the library already owns",
   "keywords": [
     "llm",
